@@ -27,9 +27,11 @@ const INDEX_FILE: &str = "/index.html";
 thread_local! {
     static STATE: State = State::default();
     static ASSET_HASHES: RefCell<AssetHashes> = RefCell::new(RbTree::new());
+    static CHUNK_HASHES: RefCell<HashMap<Key, ChunkHashes>> = RefCell::new(HashMap::new());
 }
 
 type AssetHashes = RbTree<Key, Hash>;
+type ChunkHashes = RbTree<Key, Hash>;
 
 #[derive(Default)]
 struct State {
@@ -54,6 +56,7 @@ pub struct StableState {
 struct AssetEncoding {
     modified: Timestamp,
     content_chunks: Vec<RcBytes>,
+    content_sha256: Vec<[u8; 32]>,
     total_length: usize,
     certified: bool,
     sha256: [u8; 32],
@@ -92,6 +95,7 @@ struct AssetEncodingDetails {
 struct Chunk {
     batch_id: BatchId,
     content: RcBytes,
+    sha256: [u8; 32],
 }
 
 struct Batch {
@@ -185,6 +189,7 @@ struct CreateBatchResponse {
 struct CreateChunkArg {
     batch_id: BatchId,
     content: ByteBuf,
+    sha256: Option<ByteBuf>,
 }
 
 #[derive(Clone, Debug, CandidType, Deserialize)]
@@ -244,6 +249,7 @@ enum StreamingStrategy {
 struct StreamingCallbackHttpResponse {
     body: RcBytes,
     token: Option<StreamingCallbackToken>,
+    chunk_tree: String,
 }
 
 #[update]
@@ -337,11 +343,22 @@ fn create_chunk(arg: CreateChunkArg) -> CreateChunkResponse {
         let chunk_id = s.next_chunk_id.borrow().clone();
         *s.next_chunk_id.borrow_mut() += 1;
 
+        let sha256: [u8; 32] = match arg.sha256 {
+            Some(bytes) => bytes
+                .into_vec()
+                .try_into()
+                .unwrap_or_else(|_| trap("invalid SHA-256")),
+            None => {
+                hash_bytes(&arg.content)
+            }
+        };
+
         s.chunks.borrow_mut().insert(
             chunk_id.clone(),
             Chunk {
                 batch_id: arg.batch_id,
                 content: RcBytes::from(arg.content),
+                sha256,
             },
         );
 
@@ -575,13 +592,15 @@ fn build_http_response(path: &str, encodings: Vec<String>, index: usize) -> Http
     STATE.with(|s| {
         let assets = s.assets.borrow();
 
+        let chunk_tree = get_serialized_chunk_witness(path, index);
+
         let index_redirect_certificate = ASSET_HASHES.with(|t| {
             let tree = t.borrow();
             if tree.get(path.as_bytes()).is_none() && tree.get(INDEX_FILE.as_bytes()).is_some() {
                 let absence_proof = tree.witness(path.as_bytes());
                 let index_proof = tree.witness(INDEX_FILE.as_bytes());
                 let combined_proof = merge_hash_trees(absence_proof, index_proof);
-                Some(witness_to_header(combined_proof))
+                Some(witness_to_header(combined_proof, chunk_tree.clone()))
             } else {
                 None
             }
@@ -607,7 +626,7 @@ fn build_http_response(path: &str, encodings: Vec<String>, index: usize) -> Http
         }
 
         let certificate_header =
-            ASSET_HASHES.with(|t| witness_to_header(t.borrow().witness(path.as_bytes())));
+            ASSET_HASHES.with(|t| witness_to_header(t.borrow().witness(path.as_bytes()), chunk_tree.clone()));
 
         if let Some(asset) = assets.get(path) {
             for enc_name in encodings.iter() {
@@ -728,11 +747,16 @@ fn check_url_decode() {
 #[query]
 fn http_request(req: HttpRequest) -> HttpResponse {
     let mut encodings = vec![];
+    let mut index: usize = 0;
+
     for (name, value) in req.headers.iter() {
         if name.eq_ignore_ascii_case("Accept-Encoding") {
             for v in value.split(',') {
                 encodings.push(v.trim().to_string());
             }
+        }
+        if name.eq_ignore_ascii_case("Custom-Index") {
+            index = value.parse::<usize>().unwrap_or(0);
         }
     }
     encodings.push("identity".to_string());
@@ -742,7 +766,7 @@ fn http_request(req: HttpRequest) -> HttpResponse {
         None => &req.url[..],
     };
     match url_decode(path) {
-        Ok(path) => build_http_response(&path, encodings, 0),
+        Ok(path) => build_http_response(&path, encodings, index),
         Err(err) => HttpResponse {
             status_code: 400,
             headers: vec![],
@@ -783,9 +807,12 @@ fn http_request_streaming_callback(
         // MAX is good enough. This means a chunk would be above 64-bits, which is impossible...
         let chunk_index = index.0.to_usize().unwrap_or(usize::MAX);
 
+        let chunk_tree = get_serialized_chunk_witness(&key, chunk_index);
+
         StreamingCallbackHttpResponse {
             body: enc.content_chunks[chunk_index].clone(),
             token: create_token(asset, &content_encoding, enc, &key, chunk_index),
+            chunk_tree: chunk_tree.clone(),
         }
     })
 }
@@ -824,22 +851,25 @@ fn do_set_asset_content(arg: SetAssetContentArguments) {
         let mut chunks = s.chunks.borrow_mut();
 
         let mut content_chunks = vec![];
+        let mut content_sha256 = vec![];
         for chunk_id in arg.chunk_ids.iter() {
             let chunk = chunks.remove(chunk_id).expect("chunk not found");
             content_chunks.push(chunk.content);
+            content_sha256.push(chunk.sha256);
         }
 
+        set_chunks_to_tree(&arg.key, &content_sha256);
         let sha256: [u8; 32] = match arg.sha256 {
             Some(bytes) => bytes
                 .into_vec()
                 .try_into()
                 .unwrap_or_else(|_| trap("invalid SHA-256")),
             None => {
-                let mut hasher = sha2::Sha256::new();
-                for chunk in content_chunks.iter() {
-                    hasher.update(chunk);
-                }
-                hasher.finalize().into()
+                CHUNK_HASHES.with(|t| {
+                    let chunks_map = t.borrow_mut();
+                    let tree = chunks_map.get(&arg.key).unwrap_or_else(|| trap("asset not found in chunks map"));
+                    tree.root_hash()
+                })
             }
         };
 
@@ -847,6 +877,7 @@ fn do_set_asset_content(arg: SetAssetContentArguments) {
         let enc = AssetEncoding {
             modified: now,
             content_chunks,
+            content_sha256,
             certified: false,
             total_length,
             sha256,
@@ -913,6 +944,7 @@ fn on_asset_change(key: &str, asset: &mut Asset) {
 
     if asset.encodings.is_empty() {
         delete_asset_hash(key);
+        delete_chunks(key);
         return;
     }
 
@@ -927,6 +959,8 @@ fn on_asset_change(key: &str, asset: &mut Asset) {
         if let Some(enc) = asset.encodings.get_mut(*enc_name) {
             certify_asset(key.to_string(), &enc.sha256);
             enc.certified = true;
+            // TODO Run twice when saving asset (do_set_asset_content method)
+            set_chunks_to_tree(&key.to_string(), &enc.content_sha256);
             return;
         }
     }
@@ -937,6 +971,8 @@ fn on_asset_change(key: &str, asset: &mut Asset) {
     if let Some(enc) = asset.encodings.values_mut().next() {
         certify_asset(key.to_string(), &enc.sha256);
         enc.certified = true;
+        // TODO Run twice when saving asset (do_set_asset_content method)
+        set_chunks_to_tree(&key.to_string(), &enc.content_sha256);
     }
 }
 
@@ -962,14 +998,11 @@ fn set_root_hash(tree: &AssetHashes) {
     set_certified_data(&full_tree_hash);
 }
 
-fn witness_to_header(witness: HashTree) -> HeaderField {
+fn witness_to_header(witness: HashTree, chunk_serialized_tree: String) -> HeaderField {
     use ic_certified_map::labeled;
 
     let hash_tree = labeled(b"http_assets", witness);
-    let mut serializer = serde_cbor::ser::Serializer::new(vec![]);
-    serializer.self_describe().unwrap();
-    hash_tree.serialize(&mut serializer).unwrap();
-
+    let tree = serialize_tree(hash_tree);
     let certificate = data_certificate().unwrap_or_else(|| trap("no data certificate available"));
 
     (
@@ -977,9 +1010,48 @@ fn witness_to_header(witness: HashTree) -> HeaderField {
         String::from("certificate=:")
             + &base64::encode(&certificate)
             + ":, tree=:"
-            + &base64::encode(&serializer.into_inner())
+            + &tree
+            + ":, chunk_tree=:"
+            + &chunk_serialized_tree
             + ":",
     )
+}
+
+fn get_serialized_chunk_witness(key: &str, index: usize) -> String {
+    CHUNK_HASHES.with(|t| {
+        let chunks_map = t.borrow();
+        let tree = chunks_map.get(key).unwrap_or_else(|| trap("asset not found in chunks map"));
+
+        if tree.get(index.to_string().as_bytes()).is_some() {
+            let witness = tree.witness(index.to_string().as_bytes());
+            serialize_tree(witness)
+        } else {
+            String::new()
+        }
+    })
+}
+
+fn set_chunks_to_tree(key: &String, content_sha256: &Vec<[u8; 32]>) {
+    CHUNK_HASHES.with(|t| {
+        let mut chunks_map = t.borrow_mut();
+
+        let tree = chunks_map.entry(key.clone()).or_insert(RbTree::new());
+
+        for (i, sha256) in content_sha256.iter().enumerate() {
+            tree.insert(i.to_string(), *sha256);
+        }
+    });
+}
+
+fn delete_chunks(key: &str) {
+    CHUNK_HASHES.with(|t| (t.borrow_mut().remove(key)));
+}
+
+fn serialize_tree(tree: HashTree) -> String {
+    let mut serializer = serde_cbor::ser::Serializer::new(vec![]);
+    serializer.self_describe().unwrap();
+    tree.serialize(&mut serializer).unwrap();
+    base64::encode(&serializer.into_inner())
 }
 
 fn merge_hash_trees<'a>(lhs: HashTree<'a>, rhs: HashTree<'a>) -> HashTree<'a> {
