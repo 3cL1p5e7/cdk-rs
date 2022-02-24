@@ -177,6 +177,12 @@ struct GetArg {
 }
 
 #[derive(Clone, Debug, CandidType, Deserialize)]
+struct GetChunksInfoArg {
+    key: Key,
+    content_encoding: String,
+}
+
+#[derive(Clone, Debug, CandidType, Deserialize)]
 struct GetChunkArg {
     key: Key,
     content_encoding: String,
@@ -220,12 +226,12 @@ struct HttpRequest {
 #[derive(Clone, Debug, CandidType, Deserialize)]
 struct ChunkInfo {
     chunk_id: ChunkId,
-    total_length: Nat,
+    chunk_length: u64,
 }
 
 #[derive(Clone, Debug, CandidType, Deserialize)]
 struct ChunksInfoReponse {
-    total_length: Nat,
+    total_length: u64,
     chunks: Vec<ChunkInfo>,
 }
 
@@ -448,7 +454,7 @@ fn get(arg: GetArg) -> EncodedAsset {
 }
 
 #[query]
-fn get_chunks_info(arg: GetArg) -> ChunksInfoReponse {
+fn get_chunks_info(arg: GetChunksInfoArg) -> ChunksInfoReponse {
     STATE.with(|s| {
         let assets = s.assets.borrow();
         let asset = assets.get(&arg.key).unwrap_or_else(|| {
@@ -456,20 +462,19 @@ fn get_chunks_info(arg: GetArg) -> ChunksInfoReponse {
         });
 
         let mut result = ChunksInfoReponse {
-            total_length: Nat::from(0),
+            total_length: 0,
             chunks: vec![],
         };
 
-
-        for enc in arg.accept_encodings.iter() {
-            if let Some(asset_enc) = asset.encodings.get(enc) {
-                for (i, chunk) in asset_enc.content_chunks.iter().enumerate() {
-                    result.total_length = result.total_length + asset_enc.total_length;
-                    result.chunks.push(ChunkInfo {
-                        chunk_id: Nat::from(i),
-                        total_length: Nat::from(chunk.content.len()),
-                    });
-                }
+        let enc = arg.content_encoding;
+        if let Some(asset_enc) = asset.encodings.get(&enc) {
+            for (i, chunk) in asset_enc.content_chunks.iter().enumerate() {
+                let chunk_length = chunk.content.len() as u64;
+                result.total_length += chunk_length;
+                result.chunks.push(ChunkInfo {
+                    chunk_id: Nat::from(i),
+                    chunk_length,
+                });
             }
         }
         result
