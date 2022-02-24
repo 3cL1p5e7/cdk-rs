@@ -4,6 +4,7 @@ use crate::rc_bytes::RcBytes;
 use ic_cdk::api::{caller, data_certificate, set_certified_data, time, trap};
 use ic_cdk::export::candid::{CandidType, Deserialize, Func, Int, Nat, Principal};
 use ic_cdk_macros::{query, update};
+use ic_cdk::{print};
 use ic_certified_map::{AsHashTree, Hash, HashTree, RbTree};
 use num_traits::ToPrimitive;
 use serde::Serialize;
@@ -55,10 +56,18 @@ pub struct StableState {
 #[derive(Default, Clone, Debug, CandidType, Deserialize)]
 struct AssetEncoding {
     modified: Timestamp,
-    content_chunks: Vec<RcBytes>,
-    content_sha256: Vec<[u8; 32]>,
+    content_chunks: Vec<ContentChunk>,
     total_length: usize,
     certified: bool,
+    sha256: [u8; 32],
+}
+
+// Thanks https://github.com/dfinity/cdk-rs/pull/199
+#[derive(Clone, Debug, CandidType, Deserialize)]
+struct ContentChunk {
+    content: RcBytes,
+    start_byte: u64,
+    end_byte: u64,
     sha256: [u8; 32],
 }
 
@@ -275,7 +284,7 @@ fn retrieve(key: Key) -> RcBytes {
         if id_enc.content_chunks.len() > 1 {
             trap("Asset too large. Use get() and get_chunk() instead.");
         }
-        id_enc.content_chunks[0].clone()
+        id_enc.content_chunks[0].content.clone()
     })
 }
 
@@ -295,7 +304,14 @@ fn store(arg: StoreArg) {
 
         let encoding = asset.encodings.entry(arg.content_encoding).or_default();
         encoding.total_length = arg.content.len();
-        encoding.content_chunks = vec![RcBytes::from(arg.content)];
+        encoding.content_chunks = vec![
+            ContentChunk {
+                content: RcBytes::from(arg.content),
+                start_byte: 0,
+                end_byte: (encoding.total_length - 1) as u64,
+                sha256: hash
+            }
+        ];
         encoding.modified = Int::from(time() as u64);
         encoding.sha256 = hash;
 
@@ -419,7 +435,7 @@ fn get(arg: GetArg) -> EncodedAsset {
         for enc in arg.accept_encodings.iter() {
             if let Some(asset_enc) = asset.encodings.get(enc) {
                 return EncodedAsset {
-                    content: asset_enc.content_chunks[0].clone(),
+                    content: asset_enc.content_chunks[0].content.clone(),
                     content_type: asset.content_type.clone(),
                     content_encoding: enc.clone(),
                     total_length: Nat::from(asset_enc.total_length as u64),
@@ -451,7 +467,7 @@ fn get_chunks_info(arg: GetArg) -> ChunksInfoReponse {
                     result.total_length = result.total_length + asset_enc.total_length;
                     result.chunks.push(ChunkInfo {
                         chunk_id: Nat::from(i),
-                        total_length: Nat::from(chunk.len()),
+                        total_length: Nat::from(chunk.content.len()),
                     });
                 }
             }
@@ -484,7 +500,7 @@ fn get_chunk(arg: GetChunkArg) -> GetChunkResponse {
         let index: usize = arg.index.0.to_usize().unwrap();
 
         GetChunkResponse {
-            content: enc.content_chunks[index].clone(),
+            content: enc.content_chunks[index].content.clone(),
         }
     })
 }
@@ -574,7 +590,7 @@ fn build_200(
     HttpResponse {
         status_code: 200,
         headers,
-        body: enc.content_chunks[chunk_index].clone(),
+        body: enc.content_chunks[chunk_index].content.clone(),
         streaming_strategy,
     }
 }
@@ -725,6 +741,45 @@ fn url_decode(url: &str) -> Result<String, UrlDecodeError> {
     .collect()
 }
 
+#[derive(Debug)]
+struct Range {
+    start_byte: u64,
+    end_byte: Option<u64>,
+}
+
+fn get_ranges(range_header_value: &str) -> Option<Vec<Range>> {
+    let pure_range_header_value = range_header_value.replace("bytes=", "");
+    let range_strings = pure_range_header_value.split(",");
+
+    range_strings
+        .map(|range_string| {
+            let bytes_string = range_string
+                .split("-")
+                .collect::<Vec<&str>>();
+
+            match (bytes_string.get(0), bytes_string.get(1)) {
+                (Some(start_byte_string), Some(end_byte_string)) =>
+                    match (start_byte_string.parse::<u64>(), end_byte_string.parse::<u64>()) {
+                        (Ok(start_byte), Ok(end_byte)) => Some(Range {
+                            start_byte,
+                            end_byte: Some(end_byte),
+                        }),
+                        _ => None
+                    },
+                (Some(start_byte_string), None) =>
+                    match start_byte_string.parse::<u64>() {
+                        Ok(start_byte) => Some(Range {
+                            start_byte,
+                            end_byte: None,
+                        }),
+                        _ => None
+                    },
+                _ => None
+            }
+        })
+        .collect::<Option<Vec<Range>>>()
+}
+
 #[test]
 fn check_url_decode() {
     assert_eq!(
@@ -747,7 +802,7 @@ fn check_url_decode() {
 #[query]
 fn http_request(req: HttpRequest) -> HttpResponse {
     let mut encodings = vec![];
-    let mut index: usize = 0;
+    let mut range_header_value = "";
 
     for (name, value) in req.headers.iter() {
         if name.eq_ignore_ascii_case("Accept-Encoding") {
@@ -755,10 +810,17 @@ fn http_request(req: HttpRequest) -> HttpResponse {
                 encodings.push(v.trim().to_string());
             }
         }
-        if name.eq_ignore_ascii_case("Custom-Index") {
-            index = value.parse::<usize>().unwrap_or(0);
+        if name.eq_ignore_ascii_case("Range") {
+            range_header_value = value;
         }
     }
+    let ranges = get_ranges(range_header_value);
+    if let Some(r) = ranges {
+        print(format!("Range {}-{}", r[0].start_byte, r[0].end_byte.unwrap_or(0)));
+    } else {
+        print(format!("No range in '{}'", range_header_value));
+    }
+
     encodings.push("identity".to_string());
 
     let path = match req.url.find('?') {
@@ -766,7 +828,7 @@ fn http_request(req: HttpRequest) -> HttpResponse {
         None => &req.url[..],
     };
     match url_decode(path) {
-        Ok(path) => build_http_response(&path, encodings, index),
+        Ok(path) => build_http_response(&path, encodings, 0), // FIXME
         Err(err) => HttpResponse {
             status_code: 400,
             headers: vec![],
@@ -806,11 +868,10 @@ fn http_request_streaming_callback(
 
         // MAX is good enough. This means a chunk would be above 64-bits, which is impossible...
         let chunk_index = index.0.to_usize().unwrap_or(usize::MAX);
-
         let chunk_tree = get_serialized_chunk_witness(&key, chunk_index);
 
         StreamingCallbackHttpResponse {
-            body: enc.content_chunks[chunk_index].clone(),
+            body: enc.content_chunks[chunk_index].content.clone(),
             token: create_token(asset, &content_encoding, enc, &key, chunk_index),
             chunk_tree: chunk_tree.clone(),
         }
@@ -850,15 +911,21 @@ fn do_set_asset_content(arg: SetAssetContentArguments) {
 
         let mut chunks = s.chunks.borrow_mut();
 
-        let mut content_chunks = vec![];
-        let mut content_sha256 = vec![];
+        let mut content_chunks: Vec<ContentChunk> = vec![];
+        let mut reduced_total: u64 = 0;
         for chunk_id in arg.chunk_ids.iter() {
             let chunk = chunks.remove(chunk_id).expect("chunk not found");
-            content_chunks.push(chunk.content);
-            content_sha256.push(chunk.sha256);
+            let len = chunk.content.len() as u64;
+            content_chunks.push(ContentChunk {
+                content: chunk.content,
+                start_byte: reduced_total.clone(),
+                end_byte: reduced_total + len - 1,
+                sha256: chunk.sha256,
+            });
+            reduced_total += len;
         }
 
-        set_chunks_to_tree(&arg.key, &content_sha256);
+        set_chunks_to_tree(&arg.key, &content_chunks);
         let sha256: [u8; 32] = match arg.sha256 {
             Some(bytes) => bytes
                 .into_vec()
@@ -873,13 +940,11 @@ fn do_set_asset_content(arg: SetAssetContentArguments) {
             }
         };
 
-        let total_length: usize = content_chunks.iter().map(|c| c.len()).sum();
         let enc = AssetEncoding {
             modified: now,
             content_chunks,
-            content_sha256,
             certified: false,
-            total_length,
+            total_length: reduced_total as usize,
             sha256,
         };
         asset.encodings.insert(arg.content_encoding, enc);
@@ -959,8 +1024,8 @@ fn on_asset_change(key: &str, asset: &mut Asset) {
         if let Some(enc) = asset.encodings.get_mut(*enc_name) {
             certify_asset(key.to_string(), &enc.sha256);
             enc.certified = true;
-            // TODO Run twice when saving asset (do_set_asset_content method)
-            set_chunks_to_tree(&key.to_string(), &enc.content_sha256);
+            // Run twice when saving asset (do_set_asset_content method), but not overwrited here
+            set_chunks_to_tree(&key.to_string(), &enc.content_chunks);
             return;
         }
     }
@@ -971,8 +1036,8 @@ fn on_asset_change(key: &str, asset: &mut Asset) {
     if let Some(enc) = asset.encodings.values_mut().next() {
         certify_asset(key.to_string(), &enc.sha256);
         enc.certified = true;
-        // TODO Run twice when saving asset (do_set_asset_content method)
-        set_chunks_to_tree(&key.to_string(), &enc.content_sha256);
+        // Run twice when saving asset (do_set_asset_content method), but not overwrited here
+        set_chunks_to_tree(&key.to_string(), &enc.content_chunks);
     }
 }
 
@@ -1031,14 +1096,16 @@ fn get_serialized_chunk_witness(key: &str, index: usize) -> String {
     })
 }
 
-fn set_chunks_to_tree(key: &String, content_sha256: &Vec<[u8; 32]>) {
+fn set_chunks_to_tree(key: &String, content_chunks: &Vec<ContentChunk>) {
     CHUNK_HASHES.with(|t| {
         let mut chunks_map = t.borrow_mut();
 
         let tree = chunks_map.entry(key.clone()).or_insert(RbTree::new());
 
-        for (i, sha256) in content_sha256.iter().enumerate() {
-            tree.insert(i.to_string(), *sha256);
+        for (i, chunk) in content_chunks.iter().enumerate() {
+            if !tree.get(i.to_string().as_bytes()).is_some() {
+                tree.insert(i.to_string(), chunk.sha256);
+            }
         }
     });
 }
