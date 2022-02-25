@@ -600,6 +600,34 @@ fn build_200(
     }
 }
 
+fn build_206(
+    asset: &Asset,
+    enc_name: &str,
+    enc: &AssetEncoding,
+    key: &str,
+    range: ContentRange,
+    certificate_header: Option<HeaderField>,
+) -> HttpResponse {
+    let mut headers = vec![("Content-Type".to_string(), asset.content_type.to_string())];
+    if enc_name != "identity" {
+        headers.push(("Content-Encoding".to_string(), enc_name.to_string()));
+    }
+    if let Some(head) = certificate_header {
+        headers.push(head);
+    }
+    headers.push(("Content-Range".to_string(), format!("bytes {}-{}/{}", range.start_byte, range.end_byte, range.total)));
+    headers.push(("Accept-Ranges".to_string(), "bytes".to_string()));
+
+    let streaming_strategy = create_strategy(asset, enc_name, enc, key, range.index);
+
+    HttpResponse {
+        status_code: 206,
+        headers,
+        body: enc.content_chunks[range.index].content.clone(),
+        streaming_strategy,
+    }
+}
+
 fn build_404(certificate_header: HeaderField) -> HttpResponse {
     HttpResponse {
         status_code: 404,
@@ -609,19 +637,89 @@ fn build_404(certificate_header: HeaderField) -> HttpResponse {
     }
 }
 
-fn build_http_response(path: &str, encodings: Vec<String>, index: usize) -> HttpResponse {
+fn get_chunk_index_by_range(range: &Option<Range>, encodings: &Vec<String>, asset: Option<&Asset>) -> ContentRange {
+    match (range, asset) {
+        (Some(range), Some(asset)) => {
+            let enc = encodings
+                .iter()
+                .find(|enc_name| {
+                    if let Some(enc) = asset.encodings.get(*enc_name) {
+                        if enc.certified {
+                            true
+                        } else {
+                            // Find if identity is certified, if it's not.
+                            if let Some(id_enc) = asset.encodings.get("identity") {
+                                id_enc.certified
+                            } else {
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    }
+                });
+            match asset.encodings.get(enc.unwrap_or(&"".to_string())) {
+                Some(asset) => {
+                    match asset.content_chunks
+                        .iter()
+                        .position(|chunk| {
+                            (range.start_byte - chunk.start_byte) < (chunk.content.len() as u64)
+                        }) {
+                            Some(index) => ContentRange {
+                                start_byte: asset.content_chunks[index].start_byte,
+                                end_byte: asset.content_chunks[index].start_byte + (asset.content_chunks[index].content.len() as u64) - 1,
+                                index,
+                                total: asset.total_length,
+                            },
+                            None => match asset.content_chunks.first() {
+                                Some(first) => ContentRange { // FIXME
+                                    start_byte: first.start_byte,
+                                    end_byte: first.end_byte,
+                                    index: 0,
+                                    total: asset.total_length,
+                                },
+                                None => ContentRange { // FIXME
+                                    start_byte: 0,
+                                    end_byte: 0,
+                                    index: 0,
+                                    total: 0,
+                                }
+                            }
+                        }
+                },
+                None => ContentRange { // FIXME
+                    start_byte: 0,
+                    end_byte: 0,
+                    index: 0,
+                    total: 0,
+                },
+            }
+        },
+        _ => ContentRange { // FIXME
+            start_byte: 0,
+            end_byte: 0,
+            index: 0,
+            total: 0,
+        }
+    }
+}
+
+fn build_http_response(path: &str, encodings: Vec<String>, range: Option<Range>) -> HttpResponse {
     STATE.with(|s| {
         let assets = s.assets.borrow();
 
-        let chunk_tree = get_serialized_chunk_witness(path, index);
-
+        let mut content_range = get_chunk_index_by_range(&range, &encodings, assets.get(INDEX_FILE));
+        print(format!("Found INDEX_FILE index {}", content_range.index));
+        
         let index_redirect_certificate = ASSET_HASHES.with(|t| {
             let tree = t.borrow();
             if tree.get(path.as_bytes()).is_none() && tree.get(INDEX_FILE.as_bytes()).is_some() {
+                let chunk_tree = get_serialized_chunk_witness(path, content_range.index);
+
                 let absence_proof = tree.witness(path.as_bytes());
                 let index_proof = tree.witness(INDEX_FILE.as_bytes());
                 let combined_proof = merge_hash_trees(absence_proof, index_proof);
-                Some(witness_to_header(combined_proof, chunk_tree.clone()))
+                Some(witness_to_header(combined_proof, chunk_tree.clone(), content_range.index))
             } else {
                 None
             }
@@ -632,47 +730,83 @@ fn build_http_response(path: &str, encodings: Vec<String>, index: usize) -> Http
                 for enc_name in encodings.iter() {
                     if let Some(enc) = asset.encodings.get(enc_name) {
                         if enc.certified {
-                            return build_200(
-                                asset,
-                                enc_name,
-                                enc,
-                                INDEX_FILE,
-                                index,
-                                Some(certificate_header),
-                            );
+                            if let Some(_) = range {
+                                return build_206(
+                                    asset,
+                                    enc_name,
+                                    enc,
+                                    path,
+                                    content_range,
+                                    Some(certificate_header),
+                                );
+                            } else {
+                                return build_200(
+                                    asset,
+                                    enc_name,
+                                    enc,
+                                    INDEX_FILE,
+                                    content_range.index,
+                                    Some(certificate_header),
+                                );
+                            }
                         }
                     }
                 }
             }
         }
 
+        content_range = get_chunk_index_by_range(&range, &encodings, assets.get(path));
+        print(format!("Found SOME index {}", content_range.index));
+        let chunk_tree = get_serialized_chunk_witness(path, content_range.index);
         let certificate_header =
-            ASSET_HASHES.with(|t| witness_to_header(t.borrow().witness(path.as_bytes()), chunk_tree.clone()));
+            ASSET_HASHES.with(|t| witness_to_header(t.borrow().witness(path.as_bytes()), chunk_tree.clone(), content_range.index));
 
         if let Some(asset) = assets.get(path) {
             for enc_name in encodings.iter() {
                 if let Some(enc) = asset.encodings.get(enc_name) {
                     if enc.certified {
-                        return build_200(
-                            asset,
-                            enc_name,
-                            enc,
-                            path,
-                            index,
-                            Some(certificate_header),
-                        );
+                        if let Some(_) = range {
+                            return build_206(
+                                asset,
+                                enc_name,
+                                enc,
+                                path,
+                                content_range,
+                                Some(certificate_header),
+                            );
+                        } else {
+                            return build_200(
+                                asset,
+                                enc_name,
+                                enc,
+                                path,
+                                content_range.index,
+                                Some(certificate_header),
+                            );
+                        }
                     } else {
                         // Find if identity is certified, if it's not.
                         if let Some(id_enc) = asset.encodings.get("identity") {
                             if id_enc.certified {
-                                return build_200(
-                                    asset,
-                                    enc_name,
-                                    enc,
-                                    path,
-                                    index,
-                                    Some(certificate_header),
-                                );
+                                if let Some(_) = range {
+                                    return build_206(
+                                        asset,
+                                        enc_name,
+                                        enc,
+                                        path,
+                                        content_range,
+                                        Some(certificate_header),
+                                    );
+                                } else {
+                                    return build_200(
+                                        asset,
+                                        enc_name,
+                                        enc,
+                                        path,
+                                        content_range.index,
+                                        Some(certificate_header),
+                                    );
+                                }
                             }
                         }
                     }
@@ -752,37 +886,69 @@ struct Range {
     end_byte: Option<u64>,
 }
 
+#[derive(Debug)]
+struct ContentRange {
+    start_byte: u64,
+    end_byte: u64,
+    index: usize,
+    total: usize,
+}
+
 fn get_ranges(range_header_value: &str) -> Option<Vec<Range>> {
-    let pure_range_header_value = range_header_value.replace("bytes=", "");
-    let range_strings = pure_range_header_value.split(",");
+    let range_strings = range_header_value.split(",");
 
     range_strings
         .map(|range_string| {
-            let bytes_string = range_string
+            let replaced_range_string = range_string.replace("bytes=", "");
+            let bytes_string = replaced_range_string
                 .split("-")
+                .map(|s| s.trim())
                 .collect::<Vec<&str>>();
 
             match (bytes_string.get(0), bytes_string.get(1)) {
-                (Some(start_byte_string), Some(end_byte_string)) =>
+                (Some(start_byte_string), Some(end_byte_string)) => {
                     match (start_byte_string.parse::<u64>(), end_byte_string.parse::<u64>()) {
                         (Ok(start_byte), Ok(end_byte)) => Some(Range {
                             start_byte,
                             end_byte: Some(end_byte),
                         }),
-                        _ => None
-                    },
-                (Some(start_byte_string), None) =>
-                    match start_byte_string.parse::<u64>() {
-                        Ok(start_byte) => Some(Range {
+                        (Ok(start_byte), _) => Some(Range {
                             start_byte,
                             end_byte: None,
                         }),
                         _ => None
-                    },
+                    }
+                },
                 _ => None
             }
         })
         .collect::<Option<Vec<Range>>>()
+}
+
+#[test]
+fn check_get_ranges() {
+    let empty = get_ranges("").unwrap_or(vec![]);
+    assert_eq!(empty.len(), 0);
+
+    let mut range = get_ranges("bytes=0-").unwrap_or_else(|| panic!("Unable to parse range"));
+    assert_eq!(range[0].start_byte, 0);
+    assert_eq!(range[0].end_byte, None);
+
+    range = get_ranges("bytes=10-11").unwrap_or_else(|| panic!("Unable to parse range"));
+    assert_eq!(range[0].start_byte, 10);
+    assert_eq!(range[0].end_byte.unwrap_or(0), 11);
+
+    range = get_ranges("bytes=10-11, 100-101").unwrap_or_else(|| panic!("Unable to parse range"));
+    assert_eq!(range[0].start_byte, 10);
+    assert_eq!(range[0].end_byte.unwrap_or(0), 11);
+    assert_eq!(range[1].start_byte, 100);
+    assert_eq!(range[1].end_byte.unwrap_or(0), 101);
+
+    range = get_ranges("bytes=10-11, bytes=100-101").unwrap_or_else(|| panic!("Unable to parse range"));
+    assert_eq!(range[0].start_byte, 10);
+    assert_eq!(range[0].end_byte.unwrap_or(0), 11);
+    assert_eq!(range[1].start_byte, 100);
+    assert_eq!(range[1].end_byte.unwrap_or(0), 101);
 }
 
 #[test]
@@ -819,13 +985,18 @@ fn http_request(req: HttpRequest) -> HttpResponse {
             range_header_value = value;
         }
     }
-    let ranges = get_ranges(range_header_value);
-    if let Some(r) = ranges {
-        print(format!("Range {}-{}", r[0].start_byte, r[0].end_byte.unwrap_or(0)));
+    
+    let range = if let Some(ranges) = get_ranges(range_header_value) {
+        // FIXME REMOVE
+        print(format!("range_header_value {}", range_header_value));
+        print(format!("Range {}-{}", ranges[0].start_byte, ranges[0].end_byte.unwrap_or(0)));
+        Some(Range {
+            start_byte: ranges[0].start_byte,
+            end_byte: ranges[0].end_byte,
+        })
     } else {
-        print(format!("No range in '{}'", range_header_value));
-    }
-
+        None
+    };
     encodings.push("identity".to_string());
 
     let path = match req.url.find('?') {
@@ -833,7 +1004,7 @@ fn http_request(req: HttpRequest) -> HttpResponse {
         None => &req.url[..],
     };
     match url_decode(path) {
-        Ok(path) => build_http_response(&path, encodings, 0), // FIXME
+        Ok(path) => build_http_response(&path, encodings, range),
         Err(err) => HttpResponse {
             status_code: 400,
             headers: vec![],
@@ -930,13 +1101,13 @@ fn do_set_asset_content(arg: SetAssetContentArguments) {
             reduced_total += len;
         }
 
-        set_chunks_to_tree(&arg.key, &content_chunks);
         let sha256: [u8; 32] = match arg.sha256 {
             Some(bytes) => bytes
-                .into_vec()
-                .try_into()
-                .unwrap_or_else(|_| trap("invalid SHA-256")),
+            .into_vec()
+            .try_into()
+            .unwrap_or_else(|_| trap("invalid SHA-256")),
             None => {
+                set_chunks_to_tree(&arg.key, &content_chunks);
                 CHUNK_HASHES.with(|t| {
                     let chunks_map = t.borrow_mut();
                     let tree = chunks_map.get(&arg.key).unwrap_or_else(|| trap("asset not found in chunks map"));
@@ -1068,7 +1239,7 @@ fn set_root_hash(tree: &AssetHashes) {
     set_certified_data(&full_tree_hash);
 }
 
-fn witness_to_header(witness: HashTree, chunk_serialized_tree: String) -> HeaderField {
+fn witness_to_header(witness: HashTree, chunk_serialized_tree: String, chunk_index: usize) -> HeaderField {
     use ic_certified_map::labeled;
 
     let hash_tree = labeled(b"http_assets", witness);
@@ -1083,6 +1254,8 @@ fn witness_to_header(witness: HashTree, chunk_serialized_tree: String) -> Header
             + &tree
             + ":, chunk_tree=:"
             + &chunk_serialized_tree
+            + ":, chunk_index=:"
+            + &chunk_index.to_string()
             + ":",
     )
 }
