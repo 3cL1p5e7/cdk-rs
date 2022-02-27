@@ -499,7 +499,6 @@ fn create_strategy(
     })
 }
 
-// only sequential upload supported!!!
 fn get_chunk_index_by_range(range: &Range, asset: &AssetEncoding) -> Option<ContentRange> {
     let start_byte = range.start_byte;
     let mut reduced = 0;
