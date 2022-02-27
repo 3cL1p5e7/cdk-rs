@@ -235,7 +235,7 @@ enum StreamingStrategy {
 struct StreamingCallbackHttpResponse {
     body: RcBytes,
     token: Option<StreamingCallbackToken>,
-    chunk_tree: String,
+    chunk_tree: Option<String>,
 }
 
 #[update]
@@ -896,7 +896,7 @@ fn http_request_streaming_callback(
         StreamingCallbackHttpResponse {
             body: enc.content_chunks[chunk_index].clone(),
             token: create_token(asset, &content_encoding, enc, &key, chunk_index),
-            chunk_tree: chunk_tree.clone(),
+            chunk_tree: Some(chunk_tree.clone()),
         }
     })
 }
