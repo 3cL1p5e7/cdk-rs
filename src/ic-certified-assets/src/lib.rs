@@ -166,12 +166,6 @@ struct GetArg {
 }
 
 #[derive(Clone, Debug, CandidType, Deserialize)]
-struct GetChunksInfoArg {
-    key: Key,
-    content_encoding: String,
-}
-
-#[derive(Clone, Debug, CandidType, Deserialize)]
 struct GetChunkArg {
     key: Key,
     content_encoding: String,
